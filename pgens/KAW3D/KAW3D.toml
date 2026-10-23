@@ -1,0 +1,86 @@
+[simulation]
+  name    = "KAW3D_001"
+  engine  = "srpic"
+  runtime = 7500.0
+
+  [simulation.domain]
+  decomposition = [8,1]
+
+[grid]
+  resolution = [840, 840, 840]
+  extent     = [[-140.0, 140.0], [-140.0, 140.0], [-140.0, 140.0]]
+
+  [grid.metric]
+    metric = "minkowski"
+
+  [grid.boundaries]
+    fields    = [["PERIODIC"], ["PERIODIC"], ["PERIODIC"]]
+    particles = [["PERIODIC"], ["PERIODIC"], ["PERIODIC"]]
+
+[scales]
+  larmor0    = 0.7071067811865476
+  skindepth0 = 0.7071067811865476
+
+[algorithms]
+  current_filters = 16
+
+  [algorithms.timestep]
+    CFL = 0.95
+
+[particles]
+  ppc0 = 1000.0
+  spatial_sorting_interval = 6000
+  use_weights = false
+
+  [[particles.species]]
+    label    = "e-"
+    mass     = 1.0
+    charge   = -1.0
+    maxnpart = 3.0e7
+
+  [[particles.species]]
+    label    = "i+"
+    mass     = 25.0
+    charge   = 1.0
+    maxnpart = 3.0e7
+
+[setup]
+  multimode = false
+  n_modes = 3
+  seed = 66
+  mm_direction = 0      # 0 = all, 1 = parallel only (ky=0), 2 = perp only (kx=0)
+  betai0 = 0.5
+  betae0 = 0.5
+  Bmaxmin_ratio = 2.0
+  h = 0.2
+  r = 10.0
+  cAi0 = 0.02
+
+[checkpoint]
+  interval_time = 10400.0
+  walltime = "47:45:00"
+  keep = 2
+
+[output]
+  format        = "BPFile"
+  interval_time = 700.0
+
+  [output.fields]
+    quantities = ["N_1", "N_2", "V_1", "V_2", "B", "E", "J", "Tij_1", "Tij_2"]
+
+  [output.particles]
+    enable = false
+
+  [output.spectra]
+    enable = true
+
+  [output.stats]
+    enable = true
+    quantities = ["N", "J.E", "E^2", "B^2", "Charge", "Tii"]
+
+[diagnostics]
+  interval = 100
+  log_level = "INFO"
+  colored_stdout = false
+  blocking_timers = false
+

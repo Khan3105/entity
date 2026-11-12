@@ -46,9 +46,10 @@
 
 [setup]
   multimode = false
-  n_modes = 3
+  n_modes = 3             # Shell radius
   seed = 66
-  mm_direction = 0      # 0 = all, 1 = parallel only (ky=0), 2 = perp only (kx=0)
+  mm_direction = 0        # 0 = all, 1 = parallel only (ky=0), 2 = perp only (kx=0)
+  kx = 3.0                # Number of wavelengths in Lx, only for Single Mode atm!
   betai0 = 0.5
   betae0 = 0.5
   Bmaxmin_ratio = 2.0

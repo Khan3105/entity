@@ -76,6 +76,7 @@ namespace user {
              real_t kTi0,
              real_t Ampl,
              real_t Lx,
+             real_t Lz,
              real_t me,
              real_t miome,
              real_t q_e,
@@ -85,14 +86,17 @@ namespace user {
              real_t brms_in = 1.0,
              Kokkos::View<int*> mode_i_in = {},
              Kokkos::View<int*> mode_j_in = {},
+             Kokkos::View<int*> mode_k_in = {},
              Kokkos::View<real_t*> phi1_in = {},
-             Kokkos::View<real_t*> phi2_in = {})
+             Kokkos::View<real_t*> phi2_in = {},
+             Kokkos::View<real_t*> phi3_in = {})
     : Ly { Ly }
     , h { h }
     , r { r }
     , kTe0 { kTe0 }
     , Ampl { Ampl }
     , Lx { Lx }
+    , Lz { Lz }
     , me { me }
     , miome { miome }
     , q_e { q_e }
@@ -102,12 +106,14 @@ namespace user {
     , brms { brms_in }
     , mode_i { mode_i_in }
     , mode_j { mode_j_in }
+    , mode_k { mode_k_in }
     , phi1 { phi1_in }
     , phi2 { phi2_in }
+    , phi3 { phi3_in }
     {}
 
   private:
-    real_t Ly, Lx, h, r, kTe0, Ampl, me, miome, q_e;
+    real_t Lz, Ly, Lx, h, r, kTe0, Ampl, me, miome, q_e;
     Equilibrium<D> eq;
 
     bool multimode;
@@ -115,12 +121,14 @@ namespace user {
     real_t brms;
     Kokkos::View<int*>    mode_i;
     Kokkos::View<int*>    mode_j;
+    Kokkos::View<int*>    mode_k;
     Kokkos::View<real_t*> phi1;
     Kokkos::View<real_t*> phi2;
+    Kokkos::View<real_t*> phi3;
 
 
     // B-field perturbation
-    Inline auto bz_pert(real_t x, real_t y) const -> real_t { 
+    Inline auto bz_pert(real_t x, real_t y, real_t z) const -> real_t { 
       if (!multimode) { 
         return Ampl * math::cos(2 * PI / Lx * (x - Lx/2));
      }
@@ -128,14 +136,16 @@ namespace user {
      for (int m = 0; m < n_mode_pairs; m++) {
         real_t kx = 2 * PI * mode_i(m) / Lx;
         real_t ky = 2 * PI * mode_j(m) / Ly;
-        real_t arg = kx * x + ky * y;
+        real_t kz = 2 * PI * mode_k(m) / Lz;
+        real_t arg = kx * x + ky * y + kz * z;
         sum += math::cos(arg + phi1(m));
         sum += math::cos(arg + phi2(m));
+        sum += math::cos(arg + phi3(m));
       }
       return sum / brms * Ampl;
     }
 
-    Inline auto dbzdx(real_t x, real_t y) const -> real_t { 
+    Inline auto dbzdx(real_t x, real_t y, real_t z) const -> real_t { 
       if (!multimode) {
         return -2 * PI / Lx * Ampl * math::sin(2 * PI / Lx * (x - Lx / 2));
       }
@@ -143,14 +153,16 @@ namespace user {
       for (int m = 0; m < n_mode_pairs; m++) {
         real_t kx = 2 * PI * mode_i(m) / Lx;
         real_t ky = 2 * PI * mode_j(m) / Ly;
-        real_t arg = kx * x + ky * y;
+        real_t kz = 2 * PI * mode_k(m) / Lz;
+        real_t arg = kx * x + ky * y + kz * z;
         sum += -kx * math::sin(arg + phi1(m));
         sum += -kx * math::sin(arg + phi2(m));
+        sum += -kx * math::sin(arg + phi3(m));
       }
       return sum / brms * Ampl;
     }
 
-    Inline auto dbzdy(real_t x, real_t y) const -> real_t { 
+    Inline auto dbzdy(real_t x, real_t y, real_t z) const -> real_t { 
       if (!multimode) {
         return ZERO;
       }
@@ -158,17 +170,35 @@ namespace user {
       for (int m = 0; m < n_mode_pairs; m++) {
         real_t kx = 2 * PI * mode_i(m) / Lx;
         real_t ky = 2 * PI * mode_j(m) / Ly;
-        real_t arg = kx * x + ky * y;
+        real_t kz = 2 * PI * mode_k(m) / Lz;
+        real_t arg = kx * x + ky * y + kz * z;
         sum += -ky * math::sin(arg + phi1(m));
         sum += -ky * math::sin(arg + phi2(m));
       }
       return sum / brms * Ampl;
     }
+  
+    Inline auto dbzdz(real_t x, real_t y, real_t z) const -> real_t { 
+      if (!multimode) {
+        return ZERO;
+      }
+      real_t sum = ZERO;
+      for (int m = 0; m < n_mode_pairs; m++) {
+        real_t kx = 2 * PI * mode_i(m) / Lx;
+        real_t ky = 2 * PI * mode_j(m) / Ly;
+        real_t kz = 2 * PI * mode_k(m) / Lz;
+        real_t arg = kx * x + ky * y + kz * z;
+        sum += -kz * math::sin(arg + phi1(m));
+        sum += -kz * math::sin(arg + phi2(m));
+        sum += -kz * math::sin(arg + phi3(m));
+      }
+      return sum / brms * Ampl;
+    }
     
     // Bulk velocity perturbation
-    Inline auto vz_pert(real_t x, real_t y) const -> real_t {
+    Inline auto vz_pert(real_t x, real_t y, real_t z) const -> real_t {
       if (!multimode) {
-        return -bz_pert(x, y) / math::sqrt(eq.ns_eq(y) * me * (1 + miome));
+        return -bz_pert(x, y, z) / math::sqrt(eq.ns_eq(y) * me * (1 + miome));
       }
       // For multimode: counter-propagating waves.
       // phi1 modes get -1/√ρ (forward), phi2 modes get +1/√ρ (backward).
@@ -177,35 +207,37 @@ namespace user {
       for (int m = 0; m < n_mode_pairs; m++) {
         real_t kx = 2 * PI * mode_i(m) / Lx;
         real_t ky = 2 * PI * mode_j(m) / Ly;
-        real_t arg = kx * x + ky * y;
+        real_t kz = 2 * PI * mode_k(m) / Lz;
+        real_t arg = kx * x + ky * y + kz * z;
         sum += math::cos(arg + phi1(m));
         sum += math::cos(arg + phi2(m));
+        sum += math::cos(arg + phi3(m));
       }
       return -sum / brms * Ampl / math::sqrt(eq.ns_eq(y) * me * (1 + miome));
     }
 
     // E-field background and perturbation
-    Inline auto Ex(real_t x, real_t y) const -> real_t { 
-      return -(dbzdx(x, y) * bz_pert(x, y)) / eq.ns_eq(y);
+    Inline auto Ex(real_t x, real_t y, real_t z) const -> real_t { 
+      return -(dbzdx(x, y, z) * bz_pert(x, y, z)) / eq.ns_eq(y);
     }
-    Inline auto Ey(real_t x, real_t y) const -> real_t { 
-      return -vz_pert(x, y) * eq.Bx_eq(y) 
+    Inline auto Ey(real_t x, real_t y, real_t z) const -> real_t { 
+      return -vz_pert(x, y, z) * eq.Bx_eq(y) 
              - eq.dBxdy(y) * eq.Bx_eq(y) / eq.ns_eq(y)
-             - dbzdy(x, y) * bz_pert(x, y) / eq.ns_eq(y)
+             - dbzdy(x, y, z) * bz_pert(x, y, z) / eq.ns_eq(y)
              - kTe0 * eq.dndy(y) / (q_e * eq.ns_eq(y));
     }
-    Inline auto Ez(real_t x, real_t y) const -> real_t { 
-      return (dbzdx(x, y) * eq.Bx_eq(y)) / eq.ns_eq(y);
+    Inline auto Ez(real_t x, real_t y, real_t z) const -> real_t { 
+      return (dbzdx(x, y, z) * eq.Bx_eq(y)) / eq.ns_eq(y);
     }
 
   public:
     Inline auto bx1(const coord_t<D>& x_Ph) const -> real_t { return eq.Bx_eq(x_Ph[1]); }
     Inline auto bx2(const coord_t<D>&) const -> real_t { return ZERO; }
-    Inline auto bx3(const coord_t<D>& x_Ph) const -> real_t { return bz_pert(x_Ph[0], x_Ph[1]); }
+    Inline auto bx3(const coord_t<D>& x_Ph) const -> real_t { return bz_pert(x_Ph[0], x_Ph[1], x_Ph[2]); }
 
-    Inline auto ex1(const coord_t<D>& x_Ph) const -> real_t { return Ex(x_Ph[0], x_Ph[1]); }
-    Inline auto ex2(const coord_t<D>& x_Ph) const -> real_t { return Ey(x_Ph[0], x_Ph[1]); }
-    Inline auto ex3(const coord_t<D>& x_Ph) const -> real_t { return Ez(x_Ph[0], x_Ph[1]); }
+    Inline auto ex1(const coord_t<D>& x_Ph) const -> real_t { return Ex(x_Ph[0], x_Ph[1], x_Ph[2]); }
+    Inline auto ex2(const coord_t<D>& x_Ph) const -> real_t { return Ey(x_Ph[0], x_Ph[1], x_Ph[2]); }
+    Inline auto ex3(const coord_t<D>& x_Ph) const -> real_t { return Ez(x_Ph[0], x_Ph[1], x_Ph[2]); }
 
   };
 
@@ -231,30 +263,35 @@ namespace user {
   struct DriftingMaxwellianZY {
     DriftingMaxwellianZY(random_number_pool_t& pool, real_t temperature,
                           real_t q_i, real_t q_e, real_t me, real_t miome,
-                          real_t Ampl, real_t Lx, real_t Ly, bool is_ion,
+                          real_t Ampl, real_t Lx, real_t Ly, real_t Lz, bool is_ion,
                           Equilibrium<D> eq,
                           bool multimode_in = false,
                           int n_mode_pairs_in = 0,
                           real_t brms_in = 1.0,
                           Kokkos::View<int*> mode_i_in = {},
                           Kokkos::View<int*> mode_j_in = {},
+                          Kokkos::View<int*> mode_k_in = {},
                           Kokkos::View<real_t*> phi1_in = {},
-                          Kokkos::View<real_t*> phi2_in = {})
+                          Kokkos::View<real_t*> phi2_in = {},
+                          Kokkos::View<real_t*> phi3_in = {})
       : pool { pool }, temperature { temperature }
       , q_i { q_i }, q_e { q_e }, me { me }, miome { miome }
-      , Ampl { Ampl }, Lx { Lx }, Ly { Ly }, is_ion { is_ion }, eq { eq }
+      , Ampl { Ampl }, Lx { Lx }, Ly { Ly }, Lz { Lz }, is_ion { is_ion }, eq { eq }
       , multimode { multimode_in }
       , n_mode_pairs { n_mode_pairs_in }
       , brms { brms_in }
       , mode_i { mode_i_in }
       , mode_j { mode_j_in }
+      , mode_k { mode_k_in }
       , phi1 { phi1_in }
       , phi2 { phi2_in }
+      , phi3 { phi3_in }
       {}
 
     Inline void operator()(const coord_t<D>& x_Ph, vec_t<Dim::_3D>& v) const {
       const auto x = x_Ph[0];
       const auto y = x_Ph[1];
+      const auto z = x_Ph[2];
 
       arch::energy_dist::SampleFromMaxwellian<false>(v, pool, temperature);
 
@@ -270,21 +307,25 @@ namespace user {
     }
 
   private:
-    Inline auto bz_pert(real_t x, real_t y) const -> real_t {
-      if (!multimode) {
-        return Ampl * math::cos(2 * PI / Lx * (x - Lx / 2));
-      }
-      real_t sum = ZERO;
-      for (int m = 0; m < n_mode_pairs; m++) {
+    // B-field perturbation
+    Inline auto bz_pert(real_t x, real_t y, real_t z) const -> real_t { 
+      if (!multimode) { 
+        return Ampl * math::cos(2 * PI / Lx * (x - Lx/2));
+     }
+     real_t sum = ZERO;
+     for (int m = 0; m < n_mode_pairs; m++) {
         real_t kx = 2 * PI * mode_i(m) / Lx;
         real_t ky = 2 * PI * mode_j(m) / Ly;
-        real_t arg = kx * x + ky * y;
+        real_t kz = 2 * PI * mode_k(m) / Lz;
+        real_t arg = kx * x + ky * y + kz * z;
         sum += math::cos(arg + phi1(m));
         sum += math::cos(arg + phi2(m));
+        sum += math::cos(arg + phi3(m));
       }
       return sum / brms * Ampl;
     }
-    Inline auto dbzdx(real_t x, real_t y) const -> real_t {
+
+    Inline auto dbzdx(real_t x, real_t y, real_t z) const -> real_t { 
       if (!multimode) {
         return -2 * PI / Lx * Ampl * math::sin(2 * PI / Lx * (x - Lx / 2));
       }
@@ -292,13 +333,16 @@ namespace user {
       for (int m = 0; m < n_mode_pairs; m++) {
         real_t kx = 2 * PI * mode_i(m) / Lx;
         real_t ky = 2 * PI * mode_j(m) / Ly;
-        real_t arg = kx * x + ky * y;
+        real_t kz = 2 * PI * mode_k(m) / Lz;
+        real_t arg = kx * x + ky * y + kz * z;
         sum += -kx * math::sin(arg + phi1(m));
         sum += -kx * math::sin(arg + phi2(m));
+        sum += -kx * math::sin(arg + phi3(m));
       }
       return sum / brms * Ampl;
     }
-    Inline auto dbzdy(real_t x, real_t y) const -> real_t { 
+
+    Inline auto dbzdy(real_t x, real_t y, real_t z) const -> real_t { 
       if (!multimode) {
         return ZERO;
       }
@@ -306,25 +350,48 @@ namespace user {
       for (int m = 0; m < n_mode_pairs; m++) {
         real_t kx = 2 * PI * mode_i(m) / Lx;
         real_t ky = 2 * PI * mode_j(m) / Ly;
-        real_t arg = kx * x + ky * y;
+        real_t kz = 2 * PI * mode_k(m) / Lz;
+        real_t arg = kx * x + ky * y + kz * z;
         sum += -ky * math::sin(arg + phi1(m));
         sum += -ky * math::sin(arg + phi2(m));
       }
       return sum / brms * Ampl;
     }
-
-    // Bulk perturbation
-    Inline auto vz_pert(real_t x, real_t y) const -> real_t {
+  
+    Inline auto dbzdz(real_t x, real_t y, real_t z) const -> real_t { 
       if (!multimode) {
-        return -bz_pert(x, y) / math::sqrt(eq.ns_eq(y) * me * (1 + miome));
+        return ZERO;
       }
       real_t sum = ZERO;
       for (int m = 0; m < n_mode_pairs; m++) {
         real_t kx = 2 * PI * mode_i(m) / Lx;
         real_t ky = 2 * PI * mode_j(m) / Ly;
-        real_t arg = kx * x + ky * y;
+        real_t kz = 2 * PI * mode_k(m) / Lz;
+        real_t arg = kx * x + ky * y + kz * z;
+        sum += -kz * math::sin(arg + phi1(m));
+        sum += -kz * math::sin(arg + phi2(m));
+        sum += -kz * math::sin(arg + phi3(m));
+      }
+      return sum / brms * Ampl;
+    }
+    
+    // Bulk velocity perturbation
+    Inline auto vz_pert(real_t x, real_t y, real_t z) const -> real_t {
+      if (!multimode) {
+        return -bz_pert(x, y, z) / math::sqrt(eq.ns_eq(y) * me * (1 + miome));
+      }
+      // For multimode: counter-propagating waves.
+      // phi1 modes get -1/√ρ (forward), phi2 modes get +1/√ρ (backward).
+      // This is the ± sign that seeds turbulence.
+      real_t sum = ZERO;
+      for (int m = 0; m < n_mode_pairs; m++) {
+        real_t kx = 2 * PI * mode_i(m) / Lx;
+        real_t ky = 2 * PI * mode_j(m) / Ly;
+        real_t kz = 2 * PI * mode_k(m) / Lz;
+        real_t arg = kx * x + ky * y + kz * z;
         sum += math::cos(arg + phi1(m));
         sum += math::cos(arg + phi2(m));
+        sum += math::cos(arg + phi3(m));
       }
       return -sum / brms * Ampl / math::sqrt(eq.ns_eq(y) * me * (1 + miome));
     }

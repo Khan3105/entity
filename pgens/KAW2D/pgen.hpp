@@ -28,7 +28,7 @@ namespace user {
   template <Dimension D>
   struct Equilibrium {
     Equilibrium(real_t B_min, real_t B_max, real_t Ly, real_t h, real_t r,
-                real_t pT0, real_t kTe0, real_t kTi0)
+                real_t pT0, real_t kTe0, real_t kTi0, real_t Cj, real_t rho0)
       : B_min { B_min }
       , B_max{ B_max }
       , Ly { Ly }
@@ -38,7 +38,9 @@ namespace user {
       , kTe0 { kTe0 }
       , kTi0 { kTi0 }
       , alpha{ (B_max - B_min) * r / (2 * math::pow(2 * h, r)) /
-              SQR(1 + 1 / math::pow(2 * h, r)) } {}
+              SQR(1 + 1 / math::pow(2 * h, r)) } 
+      , Cj { Cj }
+      , rho0 { rho0 } {}
 
     // Bx
     Inline auto Bx_eq(real_t y) const -> real_t {
@@ -57,8 +59,8 @@ namespace user {
         return -Bx_eq(y) * dBxdy(y) / (kTe0 + kTi0);
     }
     // Jz here for convenience
-    Inline auto Jz_eq(real_t y) const -> real_t { return -dBxdy(y); }
-
+    Inline auto Jz_eq(real_t y) const -> real_t { return -dBxdy(y) / Cj; }
+    real_t  Cj, rho0
   private:
     real_t B_min, B_max, Ly, h, r, pT0, kTe0, kTi0, alpha;
   };
@@ -81,6 +83,8 @@ namespace user {
              real_t miome,
              real_t q_e,
              real_t q_i,
+             real_t Cj,
+             real_t rho0,
              bool multimode_in = false,
              int n_mode_pairs_in = 0,
              real_t brms_in = 1.0,
@@ -98,7 +102,8 @@ namespace user {
     , me { me }
     , miome { miome }
     , q_e { q_e }
-    , eq { B_min, B_max, Ly, h, r, pT0, kTe0, kTi0 } 
+    , fe { fe }
+    , eq { B_min, B_max, Ly, h, r, pT0, kTe0, kTi0, Cj, rho0 } 
     , multimode { multimode_in }
     , n_mode_pairs { n_mode_pairs_in }
     , brms { brms_in }
@@ -109,7 +114,7 @@ namespace user {
     {}
 
   private:
-    real_t Ly, Lx, kx, h, r, kTe0, Ampl, me, miome, q_e;
+    real_t Ly, Lx, kx, h, r, kTe0, Ampl, me, miome, q_e, fe;
     Equilibrium<D> eq;
 
     bool multimode;
@@ -180,7 +185,7 @@ namespace user {
         real_t kx = 2 * PI * mode_i(m) / Lx;
         real_t ky = 2 * PI * mode_j(m) / Ly;
         real_t arg = kx * x + ky * y;
-        sum -= math::cos(arg + phi1(m));
+        sum += math::cos(arg + phi1(m));
         sum += math::cos(arg + phi2(m));
       }
       return -sum / brms * Ampl / math::sqrt(eq.ns_eq(y) * me * (1 + miome));
@@ -188,16 +193,16 @@ namespace user {
 
     // E-field background and perturbation
     Inline auto Ex(real_t x, real_t y) const -> real_t { 
-      return -(dbzdx(x, y) * bz_pert(x, y)) / eq.ns_eq(y);
+      return -fe * dbzdx(x, y) * bz_pert(x, y) / (eq.Cj * eq.ns_eq(y));
     }
     Inline auto Ey(real_t x, real_t y) const -> real_t { 
       return -vz_pert(x, y) * eq.Bx_eq(y) 
-             - eq.dBxdy(y) * eq.Bx_eq(y) / eq.ns_eq(y)
-             - dbzdy(x, y) * bz_pert(x, y) / eq.ns_eq(y)
-             - kTe0 * eq.dndy(y) / (q_e * eq.ns_eq(y));
+             - eq.dBxdy(y) * eq.Bx_eq(y) / (eq.Cj * eq.ns_eq(y))
+             - fe * dbzdy(x, y) * bz_pert(x, y) / (eq.Cj * eq.ns_eq(y))
+             + eq.rho0 * kTe0 * eq.dndy(y) / (q_e * eq.ns_eq(y));
     }
     Inline auto Ez(real_t x, real_t y) const -> real_t { 
-      return (dbzdx(x, y) * eq.Bx_eq(y)) / eq.ns_eq(y);
+      return - fe * dbzdx(x, y) * eq.Bx_eq(y) / (eq.Cj * eq.ns_eq(y));
     }
 
   public:
@@ -221,8 +226,10 @@ namespace user {
              real_t r,
              real_t pT0,
              real_t kTe0,
-             real_t kTi0)
-    : eq { B_min, B_max, Ly, h, r, pT0, kTe0, kTi0 } {}
+             real_t kTi0,
+             real_t Cj,
+             real_t rho0)
+    : eq { B_min, B_max, Ly, h, r, pT0, kTe0, kTi0, Cj, rho0 } {}
     Inline auto operator()(const coord_t<D>& x_Ph) const -> real_t { return 2 * eq.ns_eq(x_Ph[1]); }
   private:
     Equilibrium<D> eq;
@@ -325,7 +332,7 @@ namespace user {
         real_t kx = 2 * PI * mode_i(m) / Lx;
         real_t ky = 2 * PI * mode_j(m) / Ly;
         real_t arg = kx * x + ky * y;
-        sum -= math::cos(arg + phi1(m));
+        sum += math::cos(arg + phi1(m));
         sum += math::cos(arg + phi2(m));
       }
       return -sum / brms * Ampl / math::sqrt(eq.ns_eq(y) * me * (1 + miome));
@@ -341,22 +348,22 @@ namespace user {
 
     // 1st order species drift (total=0)
     Inline auto vx_ion(real_t x, real_t y) const -> real_t {
-      const auto dJx  = dbzdy(x, y);
+      const auto dJx  = dbzdy(x, y) / eq.Cj;
       const auto dJxi = dJx / (1 - (q_e / q_i) * miome);
       return dJxi / (q_i * eq.ns_eq(y));
     }
     Inline auto vx_electron(real_t x, real_t y) const -> real_t {
-      const auto dJx  = dbzdy(x, y);
+      const auto dJx  = dbzdy(x, y) / eq.Cj;
       const auto dJxe = dJx * miome / (miome - (q_e / q_i));
       return dJxe / (q_e * eq.ns_eq(y));
     }
     Inline auto vy_ion(real_t x, real_t y) const -> real_t {
-      const auto dJy  = -dbzdx(x, y);
+      const auto dJy  = -dbzdx(x, y) / eq.Cj;
       const auto dJyi = dJy / (1 - (q_e / q_i) * miome);
       return dJyi / (q_i * eq.ns_eq(y));
     }
     Inline auto vy_electron(real_t x, real_t y) const -> real_t {
-      const auto dJy  = -dbzdx(x, y);
+      const auto dJy  = -dbzdx(x, y) / eq.Cj;
       const auto dJye = dJy * miome / (miome - (q_e / q_i));
       return dJye / (q_e * eq.ns_eq(y));
     }
@@ -387,9 +394,9 @@ namespace user {
     const SimulationParams& params;
     const std::vector<ParticleSpecies> species;
 
-    const real_t                     c, d0, rho0, kx, betai0, betae0, Bmaxmin_ratio, h;
+    const real_t                     c, d0, rho0, Cj, kx, betai0, betae0, Bmaxmin_ratio, h;
     const real_t                     r, me, q_e, mi, q_i, cAi0;
-    const real_t                     ne0, ni0, n_tot, miome, omegape0, omegapi0, de0, di0, B_max, B_min, Ampl;
+    const real_t                     ne0, ni0, n_tot, miome, fe, omegape0, omegapi0, de0, di0, B_max, B_min, Ampl;
     const real_t                     kTi0, kTe0, vthi0, vthe0;
     const real_t                     omegaCi0, omegaCe0, rhoCi0, rhoCe0, omegae_ratio, pT0;
     const real_t                     Lx, Ly;
@@ -414,6 +421,7 @@ namespace user {
       , c    { ONE }
       , d0   { params.template get<real_t>("scales.skindepth0") }
       , rho0     { params.template get<real_t>("scales.larmor0") }
+      , Cj   { rho0 / SQR(d0) }
       , kx   { 2 * PI * params.template get<real_t>("setup.kx", 1) }
       , betai0 { params.template get<real_t>("setup.betai0", HALF) }
       , betae0 { params.template get<real_t>("setup.betae0", HALF) }
@@ -429,6 +437,7 @@ namespace user {
       , ne0 { HALF }
       , ni0 { HALF }
       , n_tot { ne0 + ni0 }
+      , fe { miome / (miome - q_e / q_i) }
       , miome { mi / me }
       , omegape0 { (c / d0) * math::sqrt(ne0 * SQR(q_e) / me) }
       , omegapi0 { (c / d0) * math::sqrt(ni0 * SQR(q_i) / mi) }
@@ -467,8 +476,8 @@ namespace user {
       // Initial conditions
       , init_flds { B_min, B_max, Ly, h, r, 
               pT0, kTe0, kTi0, Ampl, Lx, kx, 
-              me, miome, q_e, q_i }
-      , density_prof { B_min, B_max, Ly, h, r, pT0, kTe0, kTi0 }
+              me, miome, q_e, q_i, Cj, rho0 }
+      , density_prof { B_min, B_max, Ly, h, r, pT0, kTe0, kTi0, Cj, rho0 }
       {
 
         if (multimode) {
@@ -568,7 +577,7 @@ namespace user {
           init_flds = InitFields<D>(
             B_min, B_max, Ly, h, r,
             pT0, kTe0, kTi0, Ampl, Lx, kx,
-            me, miome, q_e, q_i,
+            me, miome, q_e, q_i, Cj, rho0,
             true, n_mode_pairs, brms_val,
             mode_i_v, mode_j_v, phi1_v, phi2_v
           );          
@@ -576,7 +585,7 @@ namespace user {
       }
 
     void InitPrtls(Domain<S, M>& domain) {
-      const auto eq = Equilibrium<D>(B_min, B_max, Ly, h, r, pT0, kTe0, kTi0);
+      const auto eq = Equilibrium<D>(B_min, B_max, Ly, h, r, pT0, kTe0, kTi0, Cj, rho0);
 
       const auto edist_e = DriftingMaxwellianZY<D>(
         domain.random_pool(), kTe0 / me,

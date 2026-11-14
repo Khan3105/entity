@@ -527,7 +527,7 @@ namespace kernel {
             if (c == 0) {
               coeff *= energy;
             } else {
-              coeff *= u_Phys[c - 1];
+              coeff *= (mass == ZERO ? ONE : mass) * u_Phys[c - 1];
             }
           }
           buff += dV * coeff / energy;

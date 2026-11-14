@@ -60,7 +60,7 @@ namespace user {
     }
     // Jz here for convenience
     Inline auto Jz_eq(real_t y) const -> real_t { return -dBxdy(y) / Cj; }
-    real_t  Cj, rho0
+    real_t Cj, rho0;
   private:
     real_t B_min, B_max, Ly, h, r, pT0, kTe0, kTi0, alpha;
   };
@@ -102,7 +102,7 @@ namespace user {
     , me { me }
     , miome { miome }
     , q_e { q_e }
-    , fe { fe }
+    , fe { miome / (miome - q_e / q_i) }
     , eq { B_min, B_max, Ly, h, r, pT0, kTe0, kTi0, Cj, rho0 } 
     , multimode { multimode_in }
     , n_mode_pairs { n_mode_pairs_in }
@@ -196,13 +196,13 @@ namespace user {
       return -fe * dbzdx(x, y) * bz_pert(x, y) / (eq.Cj * eq.ns_eq(y));
     }
     Inline auto Ey(real_t x, real_t y) const -> real_t { 
-      return -vz_pert(x, y) * eq.Bx_eq(y) 
-             - eq.dBxdy(y) * eq.Bx_eq(y) / (eq.Cj * eq.ns_eq(y))
+      return - vz_pert(x, y) * eq.Bx_eq(y) 
+             - fe * eq.dBxdy(y) * eq.Bx_eq(y) / (eq.Cj * eq.ns_eq(y))
              - fe * dbzdy(x, y) * bz_pert(x, y) / (eq.Cj * eq.ns_eq(y))
              + eq.rho0 * kTe0 * eq.dndy(y) / (q_e * eq.ns_eq(y));
     }
     Inline auto Ez(real_t x, real_t y) const -> real_t { 
-      return - fe * dbzdx(x, y) * eq.Bx_eq(y) / (eq.Cj * eq.ns_eq(y));
+      return fe * dbzdx(x, y) * eq.Bx_eq(y) / (eq.Cj * eq.ns_eq(y));
     }
 
   public:

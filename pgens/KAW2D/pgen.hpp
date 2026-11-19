@@ -14,6 +14,8 @@
 #include "framework/domain/domain.h"
 #include "framework/domain/metadomain.h"
 
+#include "vdf_output.hpp"
+
 #include <random>
 
 #if defined(MPI_ENABLED)
@@ -415,6 +417,9 @@ namespace user {
     InitFields<D>      init_flds;
     DensityProfile<D>  density_prof;
 
+    // on-the-fly velocity distribution functions (configured in [setup])
+    VDFOutput<S, M>    vdf;
+
     PGen(const SimulationParams& p, const Metadomain<S, M>& global_domain)
       : params { p }
       , species { params.template get<std::vector<ParticleSpecies>>("particles.species") }
@@ -580,8 +585,13 @@ namespace user {
             me, miome, q_e, q_i, Cj, rho0,
             true, n_mode_pairs, brms_val,
             mode_i_v, mode_j_v, phi1_v, phi2_v
-          );          
+          );
         };
+
+        // VDF velocities are normalised to the initial thermal speeds
+        // (species 1 = e-, species 2 = i+)
+        vdf.Init(params, global_domain,
+                 { static_cast<double>(vthe0), static_cast<double>(vthi0) });
       }
 
     void InitPrtls(Domain<S, M>& domain) {
@@ -611,6 +621,12 @@ namespace user {
         ONE,
         false);
       }
+
+    // called by the engine after every step on every rank; it only does work
+    // at VDF output times (see vdf_output.hpp)
+    void CustomPostStep(timestep_t step, simtime_t time, Domain<S, M>& domain) {
+      vdf.Process(step, time, domain);
+    }
   };
 } // namespace user
 

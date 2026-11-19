@@ -57,6 +57,20 @@
   r = 10.0
   cAi0 = 0.02
 
+  # --- on-the-fly velocity distribution functions (see vdf_output.hpp) ---
+  # writes <simulation.name>/vdf/vdf.<step>.npy, read with plot_vdf.py
+  vdf_enable        = true
+  vdf_interval_time = 700.0           # output cadence (default: same as the fields)
+  vdf_nbins         = 128             # bins per velocity axis
+  vdf_vmax          = [4.0, 4.0]      # velocity grid is +/- vmax * v_th, for (e-, i+)
+  # boxes: [x_centre, y_centre, width_x, width_y] in grid units, write all values as floats
+  vdf_boxes = [
+    [140.0,   0.0, 4.0, 4.0],
+    [140.0,  60.0, 4.0, 4.0],
+    [140.0,  80.0, 4.0, 4.0],
+    [140.0, 100.0, 4.0, 4.0],
+  ]
+
 [checkpoint]
   interval_time = 10400.0
   walltime = "47:45:00"

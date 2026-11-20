@@ -6,14 +6,12 @@
  * ------------
  * Every `vdf_interval_time` (or `vdf_interval` steps) each MPI rank loops over
  * its own particles on the device, keeps the ones that sit inside one of the
- * user-defined boxes, and histograms their velocities in three planes:
- *
- *     plane 0 : (ux, uy)      plane 1 : (ux, uz)      plane 2 : (uy, uz)
- *
- * i.e. the 2D *reduced* distributions f(ux,uy) = int f(u) duz, etc. The partial
- * histograms of all ranks are summed onto rank 0 (a box may straddle several
- * subdomains), and rank 0 writes one small self-describing .npy file per dump.
- * No particle data is ever written to disk.
+ * user-defined boxes, and histograms their velocities on a full 3D grid
+ * (ux, uy, uz). Nothing is integrated out: reduced 2D/1D distributions, slices
+ * and other cuts are all made afterwards from the cube (see plot_vdf.py). The
+ * partial histograms of all ranks are summed onto rank 0 (a box may straddle
+ * several subdomains), and rank 0 writes one self-describing .npy file per
+ * dump. No particle data is ever written to disk.
  *
  * Output
  * ------
@@ -21,19 +19,29 @@
  *   <simulation.name>/vdf/vdf_meta.json    (human-readable description)
  *
  * Each .npy holds one structured record (load with np.load(fname)[0]):
- *   step    int64                          simulation step of the dump
- *   time    float64                        simulation time of the dump
- *   species int64   [nsp]                  1-based species indices (as in the toml)
- *   vth     float64 [nsp]                  normalisation speed of each species, units of c
- *   vmax    float64 [nsp]                  half-width of the velocity grid, units of vth
- *   boxes   float64 [nbox, 4]              [xmin, xmax, ymin, ymax], units of grid.extent
- *   moments float64 [nsp, nbox, 10]        exact (unbinned) sums, see below
- *   hist    float64 [nsp, nbox, 3, nb, nb] number of particles per velocity bin
+ *   step    int64                            simulation step of the dump
+ *   time    float64                          simulation time of the dump
+ *   species int64   [nsp]                    1-based species indices (as in the toml)
+ *   vth     float64 [nsp]                    normalisation speed of each species, units of c
+ *   vmax    float64 [nsp]                    half-width of the velocity grid, units of vth
+ *   boxes   float64 [nbox, 4]                [xmin, xmax, ymin, ymax], units of grid.extent
+ *   moments float64 [nsp, nbox, 10]          exact (unbinned) sums, see below
+ *   hist3d  float32 [nsp, nbox, nb, nb, nb]  number of particles per velocity bin
  *
- * hist[s, b, p, i, j]: i bins the 1st and j the 2nd velocity component of plane
- * p; bins are uniform in u/vth with edges = linspace(-vmax, vmax, nb + 1).
- * Particles outside the velocity grid are not binned (but they are counted in
- * the moments). With particles.use_weights = true, counts are sums of weights.
+ * hist3d[s, b, i, j, k]: i bins ux, j bins uy and k bins uz; bins are uniform
+ * in u/vth with edges = linspace(-vmax, vmax, nb + 1) in every direction. A
+ * particle is binned only if all three components lie on the grid (it is
+ * always counted in the moments). With particles.use_weights = true, counts
+ * are sums of weights. The histogram is summed in float64 and stored as
+ * float32, which is exact for counts below 2^24 per bin.
+ *
+ * Size: nsp * nbox * nb^3 * 4 bytes per dump, e.g. 1.05 MB per species and box
+ * for nb = 64, 8.4 MB for nb = 128. With ~1e6 particles per box, nb = 64
+ * (dv = 0.125 vth for vmax = 4) already holds ~100 particles per bin in the
+ * core; much finer grids mostly store counting noise.
+ *
+ * Dumps of the older format (field `hist`, [nsp, nbox, 3, nb, nb], the three
+ * reduced planes) are still read by plot_vdf.py.
  *
  * moments[s, b, :] = sum over the particles in the box of
  *   w * { 1, ux, uy, uz, ux^2, uy^2, uz^2, ux*uy, ux*uz, uy*uz }
@@ -47,7 +55,7 @@
  *   vdf_enable        = true                     (default: false)
  *   vdf_boxes         = [[xc, yc, wx, wy], ...]  centre and full width of each box
  *   vdf_species       = [1, 2]                   species to record (default: all)
- *   vdf_nbins         = 128                      bins per velocity axis
+ *   vdf_nbins         = 64                       bins per velocity axis (grid has nbins^3 bins)
  *   vdf_vmax          = [4.0, 4.0]               grid half-width in vth (one value, or one per recorded species)
  *   vdf_interval_time = 700.0                    output interval in time units
  *   vdf_interval      = 0                        output interval in steps (used if no interval_time)
@@ -100,8 +108,10 @@ namespace user {
   namespace vdf {
 
     inline constexpr std::size_t kMaxBoxes = 32;  // max number of boxes
-    inline constexpr std::size_t kNPlanes  = 3;   // (ux,uy), (ux,uz), (uy,uz)
     inline constexpr std::size_t kNMoments = 10;  // see the file header
+    // upper limit on the total number of histogram bins (nsp * nbox * nb^3):
+    // 2^28 doubles = 2 GiB on every GPU and every host
+    inline constexpr std::size_t kMaxBins  = std::size_t { 1 } << 28;
     // Every particle in a box adds to the same 10 moment sums. To avoid
     // thousands of GPU threads doing atomics on the same address, particle p
     // adds to copy (p % kNLanes); the copies are summed on the host.
@@ -242,8 +252,9 @@ namespace user {
     tools::Tracker                   m_tracker;
 
     // device buffers (flattened)
-    array_t<double*> m_hist; // [nsp, nbox, plane, i, j]
-    array_t<double*> m_mom;  // [lane, nsp, nbox, moment]
+    array_t<double*>        m_hist;   // [nsp, nbox, i(ux), j(uy), k(uz)]
+    array_t<double*>        m_mom;    // [lane, nsp, nbox, moment]
+    array_mirror_t<double*> m_hist_h; // host copy of m_hist, allocated once
 
   public:
     VDFOutput() = default;
@@ -292,9 +303,9 @@ namespace user {
 
       /* velocity grid ------------------------------------------------------ */
       m_nbins = static_cast<int>(
-        vdf::ReadNumber(params, "setup.vdf_nbins", 128.0));
-      raise::ErrorIf(m_nbins < 2 or m_nbins > 4096,
-                     "VDF: vdf_nbins must be between 2 and 4096",
+        vdf::ReadNumber(params, "setup.vdf_nbins", 64.0));
+      raise::ErrorIf(m_nbins < 2 or m_nbins > 512,
+                     "VDF: vdf_nbins must be between 2 and 512",
                      HERE);
       const auto vmax_list = vdf::ReadNumberList(params, "setup.vdf_vmax");
       raise::ErrorIf(vmax_list.size() > 1 and vmax_list.size() != nsp,
@@ -378,14 +389,21 @@ namespace user {
 
       /* buffers ------------------------------------------------------------ */
       const auto nb    = static_cast<std::size_t>(m_nbins);
-      const auto nhist = nsp * nbox * vdf::kNPlanes * nb * nb;
+      const auto nhist = nsp * nbox * nb * nb * nb;
       raise::ErrorIf(
-        nhist > static_cast<std::size_t>(std::numeric_limits<int>::max()),
-        "VDF: too many bins (reduce vdf_nbins or the number of boxes)",
+        nhist > vdf::kMaxBins,
+        fmt::format("VDF: %zu x %zu x %d^3 = %zu bins is more than the limit of "
+                    "%zu (reduce vdf_nbins or the number of boxes)",
+                    nsp,
+                    nbox,
+                    m_nbins,
+                    nhist,
+                    vdf::kMaxBins),
         HERE);
-      m_hist = array_t<double*> { "vdf_hist", nhist };
-      m_mom  = array_t<double*> { "vdf_mom",
-                                  vdf::kNLanes * nsp * nbox * vdf::kNMoments };
+      m_hist   = array_t<double*> { "vdf_hist", nhist };
+      m_hist_h = Kokkos::create_mirror_view(m_hist);
+      m_mom    = array_t<double*> { "vdf_mom",
+                                    vdf::kNLanes * nsp * nbox * vdf::kNMoments };
 
       /* output directory, metadata and a short report (rank 0 only) -------- */
       m_dir = std::filesystem::path(
@@ -414,9 +432,12 @@ namespace user {
                               static_cast<unsigned int>(m_interval));
       }
       report += fmt::format(
-        "  velocity grid   : %d x %d bins in (ux,uy), (ux,uz), (uy,uz)\n",
+        "  velocity grid   : %d x %d x %d bins in (ux, uy, uz), %.3g MB per "
+        "dump\n",
         m_nbins,
-        m_nbins);
+        m_nbins,
+        m_nbins,
+        static_cast<double>(nhist * sizeof(float)) / 1.0e6);
       for (std::size_t s = 0; s < nsp; ++s) {
         report += fmt::format(
           "  species %d (%s)  : vth = %.6g c, grid = +/- %.3g vth\n",
@@ -456,10 +477,10 @@ namespace user {
 
       Compute(domain);
 
-      // this rank's partial histograms -> host
-      auto hist_h = Kokkos::create_mirror_view(m_hist);
-      auto mom_h  = Kokkos::create_mirror_view(m_mom);
-      Kokkos::deep_copy(hist_h, m_hist);
+      // this rank's partial histograms -> host (the large histogram buffer is
+      // allocated once in Init; the moments are small)
+      auto mom_h = Kokkos::create_mirror_view(m_mom);
+      Kokkos::deep_copy(m_hist_h, m_hist);
       Kokkos::deep_copy(mom_h, m_mom);
 
       // add up the lanes of the moment sums
@@ -470,8 +491,8 @@ namespace user {
           mom[i] += mom_h(lane * nmom + i);
         }
       }
-      double*    hist  = hist_h.data();
-      const auto nhist = static_cast<std::size_t>(hist_h.extent(0));
+      double*    hist  = m_hist_h.data();
+      const auto nhist = static_cast<std::size_t>(m_hist_h.extent(0));
 
 #if defined(MPI_ENABLED)
       // sum the contributions of all ranks onto the root rank
@@ -533,11 +554,11 @@ namespace user {
       const auto        nsp         = m_species.size();
       const auto        nbox        = m_boxes.size();
       const int         nb          = m_nbins;
-      const auto        nb2         = static_cast<std::size_t>(nb * nb);
+      const auto        nbs         = static_cast<std::size_t>(nb);
+      const auto        nb3         = nbs * nbs * nbs;
       const auto        nmom        = nsp * nbox * vdf::kNMoments;
       const std::size_t nlanes      = vdf::kNLanes;
       const std::size_t nmoments    = vdf::kNMoments;
-      const std::size_t nplanes     = vdf::kNPlanes;
       const bool        use_weights = m_use_weights;
       auto              hist        = m_hist;
       auto              mom         = m_mom;
@@ -596,22 +617,16 @@ namespace user {
               Kokkos::atomic_add(&mom(m0 + 8), w * ux * uz);
               Kokkos::atomic_add(&mom(m0 + 9), w * uy * uz);
 
-              // 2D histograms in the three velocity planes
-              const int  ix = vdf::BinIndex(ux, u_lo, inv_du, nb);
-              const int  iy = vdf::BinIndex(uy, u_lo, inv_du, nb);
-              const int  iz = vdf::BinIndex(uz, u_lo, inv_du, nb);
-              const auto h0 = sb * nplanes * nb2;
-              if (ix >= 0 and iy >= 0) {
-                Kokkos::atomic_add(
-                  &hist(h0 + static_cast<std::size_t>(ix * nb + iy)), w);
-              }
-              if (ix >= 0 and iz >= 0) {
-                Kokkos::atomic_add(
-                  &hist(h0 + nb2 + static_cast<std::size_t>(ix * nb + iz)), w);
-              }
-              if (iy >= 0 and iz >= 0) {
-                Kokkos::atomic_add(
-                  &hist(h0 + 2 * nb2 + static_cast<std::size_t>(iy * nb + iz)), w);
+              // full 3D histogram: bin (ix, iy, iz), iz running fastest
+              const int ix = vdf::BinIndex(ux, u_lo, inv_du, nb);
+              const int iy = vdf::BinIndex(uy, u_lo, inv_du, nb);
+              const int iz = vdf::BinIndex(uz, u_lo, inv_du, nb);
+              if (ix >= 0 and iy >= 0 and iz >= 0) {
+                const auto ib = (static_cast<std::size_t>(ix) * nbs +
+                                 static_cast<std::size_t>(iy)) *
+                                  nbs +
+                                static_cast<std::size_t>(iz);
+                Kokkos::atomic_add(&hist(sb * nb3 + ib), w);
               }
             }
           });
@@ -642,8 +657,8 @@ namespace user {
         vdf::NpyShape({ nsp }) + "), ('vth', '<f8', " + vdf::NpyShape({ nsp }) +
         "), ('vmax', '<f8', " + vdf::NpyShape({ nsp }) + "), ('boxes', '<f8', " +
         vdf::NpyShape({ nbox, 4 }) + "), ('moments', '<f8', " +
-        vdf::NpyShape({ nsp, nbox, vdf::kNMoments }) + "), ('hist', '<f8', " +
-        vdf::NpyShape({ nsp, nbox, vdf::kNPlanes, nb, nb }) +
+        vdf::NpyShape({ nsp, nbox, vdf::kNMoments }) + "), ('hist3d', '<f4', " +
+        vdf::NpyShape({ nsp, nbox, nb, nb, nb }) +
         ")], 'fortran_order': False, 'shape': (1,), }";
       // npy v1.0: magic (6) + version (2) + header length (2) + header,
       // padded with spaces and ending in '\n' so the total is a multiple of 64
@@ -695,8 +710,17 @@ namespace user {
           }
           out.write(reinterpret_cast<const char*>(mom.data()),
                     static_cast<std::streamsize>(mom.size() * sizeof(double)));
-          out.write(reinterpret_cast<const char*>(hist),
-                    static_cast<std::streamsize>(nhist * sizeof(double)));
+          // histogram: float64 -> float32, a chunk at a time
+          constexpr std::size_t kChunk = std::size_t { 1 } << 20;
+          std::vector<float>    buf(std::min(kChunk, nhist));
+          for (std::size_t i0 = 0; i0 < nhist; i0 += kChunk) {
+            const auto n = std::min(kChunk, nhist - i0);
+            for (std::size_t i = 0; i < n; ++i) {
+              buf[i] = static_cast<float>(hist[i0 + i]);
+            }
+            out.write(reinterpret_cast<const char*>(buf.data()),
+                      static_cast<std::streamsize>(n * sizeof(float)));
+          }
           if (not out) {
             throw std::runtime_error("write to " + tmpname.string() + " failed");
           }
@@ -712,19 +736,21 @@ namespace user {
 
     void WriteMeta(const std::string& simname, double cell1, double cell2) const {
       std::string js = "{\n";
-      js += "  \"description\": \"On-the-fly reduced velocity distributions, see "
-            "pgens/KAW2D/vdf_output.hpp\",\n";
+      js += "  \"description\": \"On-the-fly 3D velocity distributions in spatial "
+            "boxes, see pgens/KAW2D/vdf_output.hpp\",\n";
+      js += "  \"format_version\": 2,\n";
       js += "  \"simulation\": " + vdf::JsonString(simname) + ",\n";
       js += "  \"files\": \"vdf.<step>.npy, each holding one structured record "
-            "with fields step, time, species, vth, vmax, boxes, moments, hist\",\n";
+            "with fields step, time, species, vth, vmax, boxes, moments, "
+            "hist3d\",\n";
       js += "  \"dt\": " + vdf::JsonNumber(m_dt) + ",\n";
       js += "  \"interval_steps\": " + std::to_string(m_interval) + ",\n";
       js += "  \"interval_time\": " + vdf::JsonNumber(m_interval_time) + ",\n";
       js += "  \"nbins\": " + std::to_string(m_nbins) + ",\n";
-      js += "  \"planes\": [[\"ux\", \"uy\"], [\"ux\", \"uz\"], [\"uy\", \"uz\"]],\n";
-      js += "  \"hist_layout\": \"hist[species, box, plane, i, j]: i bins the first "
-            "and j the second component of the plane; bin edges are "
-            "linspace(-vmax, vmax, nbins + 1) in units of vth\",\n";
+      js += "  \"hist3d_layout\": \"hist3d[species, box, i, j, k] (float32): i bins "
+            "ux, j bins uy, k bins uz; bin edges are linspace(-vmax, vmax, "
+            "nbins + 1) in units of vth; a particle is binned only if all three "
+            "components are on the grid\",\n";
       js += "  \"velocity\": \"u = gamma * v (spatial part of the 4-velocity) in "
             "units of c\",\n";
       js += "  \"moments\": [\"w\", \"w*ux\", \"w*uy\", \"w*uz\", \"w*ux*ux\", "

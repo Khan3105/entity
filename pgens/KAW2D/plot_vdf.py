@@ -6,11 +6,18 @@ The simulation writes (see vdf_output.hpp)
     <sim>/vdf/vdf.<step>.npy    one file per dump (a single structured record)
     <sim>/vdf/vdf_meta.json     description: species labels, boxes, units, ...
 
+Two file formats exist, and both are read:
+    hist3d  [nsp, nbox, nb, nb, nb]  full 3D histogram over (v_x, v_y, v_z) (current)
+    hist    [nsp, nbox, 3, nb, nb]   only the reduced planes xy, xz, yz (first test runs)
+Reduced VDFs work for both; 3D VDFs and slices need hist3d.
+
 Command line
 ------------
     python plot_vdf.py KAW2D_046                        # last dump, e-, box 0, (vx, vy)
     python plot_vdf.py KAW2D_046 --step 41000 --species 2 --box 1 --plane xz
     python plot_vdf.py KAW2D_046 --all                  # all boxes x all planes
+    python plot_vdf.py KAW2D_046 --slice 0.25           # slice |v_z| < 0.125 instead of reduced
+    python plot_vdf.py KAW2D_046 --slice 0.25 --slice-centre 1.0   # slice around v_z = 1
     python plot_vdf.py KAW2D_046 --diff                 # f(t) - f(first dump)
     python plot_vdf.py KAW2D_046 --log --vlim 4         # log10 f over the whole grid
     python plot_vdf.py KAW2D_046 --moments              # N, drift, temperature vs time
@@ -18,13 +25,17 @@ Command line
 
 From Python
 -----------
-    from plot_vdf import list_dumps, load_dump, reduced_vdf, box_moments
+    from plot_vdf import list_dumps, load_dump, reduced_vdf, slice_vdf, vdf_3d, box_moments
     dumps = list_dumps("KAW2D_046")                     # [(step, path), ...]
     d = load_dump(dumps[-1][1])
     edges, f = reduced_vdf(d, species=1, box=0, plane="xy")   # f[i_vx, i_vy]
+    edges, f3 = vdf_3d(d, species=1, box=0)                   # f3[i_vx, i_vy, i_vz]
+    edges, fs, vz_range = slice_vdf(d, 1, 0, "xy", width=0.25)
 
 Velocities are in units of the initial thermal speed v_th = sqrt(T0/m) of each
 species. Strictly the code bins u = gamma*v, which equals v for v_th << c.
+Times in the plots are shown as t * Omega_ci (see OMEGA_CI below); the dumps
+themselves, and load_dump(...)["time"], stay in code units.
 """
 
 import argparse
@@ -35,8 +46,14 @@ import re
 import matplotlib.pyplot as plt
 import numpy as np
 
-# plane name -> (index in the file, first component, second component)
+# plane name -> (index in old-format files, first component, second component)
 PLANES = {"xy": (0, "x", "y"), "xz": (1, "x", "z"), "yz": (2, "y", "z")}
+# velocity component -> axis of the 3D histogram f3[i_x, i_y, i_z]
+AXIS = {"x": 0, "y": 1, "z": 2}
+
+# ion cyclotron frequency in code units (omegaCi0 in pgen.hpp: 0.004 for KAW2D
+# with cAi0 = 0.02, mi = 25); every plotted time is t * OMEGA_CI
+OMEGA_CI = 0.004
 
 
 # ----------------------------------------------------------------- reading ---
@@ -63,12 +80,19 @@ def load_meta(sim_dir):
 def load_dump(path, fields=None):
     """
     One dump as a dict of numpy arrays. Fields: step, time, species, vth, vmax,
-    boxes, moments, hist (see vdf_output.hpp). With `fields`, only those are
-    read from disk (handy for the large `hist` when only moments are needed).
+    boxes, moments, and hist3d (or hist in old files; see vdf_output.hpp).
+    With `fields`, only those are read (e.g. fields=("moments", "vth")).
+
+    The 3D histogram is not read into memory here: d["hist3d"] is a read-only
+    memory-mapped view of the file, so vdf_3d(d, species, box) reads only that
+    species and box from disk.
     """
-    rec = np.load(path, mmap_mode="r")[0]
-    names = rec.dtype.names if fields is None else ("step", "time", "species", *fields)
-    d = {name: np.array(rec[name]) for name in dict.fromkeys(names)}
+    arr = np.load(path, mmap_mode="r")
+    names = arr.dtype.names if fields is None else ("step", "time", "species", *fields)
+    d = {}
+    for name in dict.fromkeys(names):
+        col = arr[name][0]
+        d[name] = col if name == "hist3d" else np.array(col)
     d["step"], d["time"] = int(d["step"]), float(d["time"])
     return d
 
@@ -82,10 +106,41 @@ def _isp(d, species):
 
 
 # ---------------------------------------------------------------- analysis ---
+def has_3d(d):
+    """True if the dump holds the full 3D histogram (needed for slices)."""
+    return "hist3d" in d
+
+
 def velocity_edges(d, species):
     """Bin edges of the velocity grid, in units of v_th of that species."""
     vmax = d["vmax"][_isp(d, species)]
-    return np.linspace(-vmax, vmax, d["hist"].shape[-1] + 1)
+    nb = (d["hist3d"] if has_3d(d) else d["hist"]).shape[-1]
+    return np.linspace(-vmax, vmax, nb + 1)
+
+
+def _third_axis(plane):
+    """Axis of f3[i_x, i_y, i_z] that is not in the plane ('xy' -> 2)."""
+    _, a, b = PLANES[plane]
+    return 3 - AXIS[a] - AXIS[b]
+
+
+def vdf_3d(d, species, box):
+    """
+    Full 3D VDF f(v_x, v_y, v_z), velocities in units of v_th. Normalised so that
+    sum(f) * dv**3 is the fraction of the particles in the box that fall inside
+    the velocity grid (~1); a Maxwellian peaks at (2 pi)^(-3/2) = 0.0635.
+    Returns (edges, f) with f[i_x, i_y, i_z]. Needs a dump with hist3d.
+    """
+    if not has_3d(d):
+        raise ValueError("this dump only has the reduced 2D planes (old format): "
+                         "3D VDFs and slices need a dump with hist3d")
+    isp = _isp(d, species)
+    counts = np.asarray(d["hist3d"][isp, box], dtype=np.float64)
+    edges = velocity_edges(d, species)
+    dv = edges[1] - edges[0]
+    ntot = d["moments"][isp, box, 0]
+    f = counts / (ntot * dv**3) if ntot > 0 else np.zeros_like(counts)
+    return edges, f
 
 
 def reduced_vdf(d, species, box, plane="xy"):
@@ -93,8 +148,11 @@ def reduced_vdf(d, species, box, plane="xy"):
     2D reduced VDF f(v_a, v_b) = integral of f over v_c, with velocities in units
     of v_th. Normalised so that sum(f) * dv**2 is the fraction of the particles in
     the box that fall inside the velocity grid (~1); a Maxwellian peaks at 1/(2 pi).
-    Returns (edges, f) with f[i_a, i_b].
+    Returns (edges, f) with f[i_a, i_b]. Works for both file formats.
     """
+    if has_3d(d):
+        edges, f3 = vdf_3d(d, species, box)
+        return edges, f3.sum(axis=_third_axis(plane)) * (edges[1] - edges[0])
     isp = _isp(d, species)
     counts = d["hist"][isp, box, PLANES[plane][0]]
     edges = velocity_edges(d, species)
@@ -102,6 +160,25 @@ def reduced_vdf(d, species, box, plane="xy"):
     ntot = d["moments"][isp, box, 0]
     f = counts / (ntot * dv**2) if ntot > 0 else np.zeros_like(counts)
     return edges, f
+
+
+def slice_vdf(d, species, box, plane="xy", width=0.25, centre=0.0):
+    """
+    Slice of the 3D VDF: f(v_a, v_b, v_c) averaged over the v_c bins whose
+    centres lie within centre +/- width/2 (at least the bin nearest to centre).
+    Same units as vdf_3d, so a Maxwellian sliced through its centre peaks at
+    (2 pi)^(-3/2) = 0.0635 (the reduced VDF peaks at 1/(2 pi)). For a slice
+    through the bulk flow use centre = box_moments(d, species, box)["U"][axis].
+    Returns (edges, f, (vc_lo, vc_hi)) with f[i_a, i_b] and the v_c range used.
+    """
+    edges, f3 = vdf_3d(d, species, box)
+    c = _third_axis(plane)
+    vc = 0.5 * (edges[1:] + edges[:-1])
+    idx = np.flatnonzero(np.abs(vc - centre) <= 0.5 * width + 1e-9)
+    if idx.size == 0:
+        idx = np.array([np.argmin(np.abs(vc - centre))])
+    f = np.take(f3, idx, axis=c).mean(axis=c)
+    return edges, f, (edges[idx[0]], edges[idx[-1] + 1])
 
 
 def reduced_vdf_1d(d, species, box, axis="x"):
@@ -153,14 +230,25 @@ def box_title(d, box):
     return f"box {box}: x=[{x0:g}, {x1:g}], y=[{y0:g}, {y1:g}]"
 
 
+def vdf_2d(d, species, box, plane="xy", slice_width=None, slice_centre=0.0):
+    """reduced_vdf, or slice_vdf if slice_width is given. Returns (edges, f)."""
+    if slice_width is None:
+        return reduced_vdf(d, species, box, plane)
+    edges, f, _ = slice_vdf(d, species, box, plane, slice_width, slice_centre)
+    return edges, f
+
+
 def plot_vdf(ax, d, species, box, plane="xy", vlim=2.5, nlevels=20, log=False,
-             nsmooth=0, ref=None, sub="e", cmap="jet"):
+             nsmooth=0, ref=None, sub="e", cmap="jet", slice_width=None,
+             slice_centre=0.0):
     """
-    Filled contours of f(v_a, v_b) on `ax`. Values below the lowest level are
-    left white. With `ref` (another dump) the difference f - f_ref is shown.
-    Returns the contour set (for a colorbar), or None if the box is empty.
+    Filled contours of f(v_a, v_b) on `ax`: the reduced VDF, or with
+    `slice_width` a slice of the 3D VDF (see slice_vdf). Values below the lowest
+    level are left white. With `ref` (another dump) the difference f - f_ref is
+    shown. Returns the contour set (for a colorbar), or None if the box is empty.
     """
-    edges, f = reduced_vdf(d, species, box, plane)
+    sl = dict(slice_width=slice_width, slice_centre=slice_centre)
+    edges, f = vdf_2d(d, species, box, plane, **sl)
     f = smooth(f, nsmooth)
     v = 0.5 * (edges[1:] + edges[:-1])
     _, a, b = PLANES[plane]
@@ -168,7 +256,7 @@ def plot_vdf(ax, d, species, box, plane="xy", vlim=2.5, nlevels=20, log=False,
     if f.max() <= 0:
         ax.text(0.5, 0.5, "no particles", transform=ax.transAxes, ha="center")
     elif ref is not None:
-        df = f - smooth(reduced_vdf(ref, species, box, plane)[1], nsmooth)
+        df = f - smooth(vdf_2d(ref, species, box, plane, **sl)[1], nsmooth)
         lim = np.abs(df).max()
         if lim > 0:
             levels = np.linspace(-lim, lim, 2 * nlevels + 1)
@@ -194,7 +282,7 @@ def plot_vdf(ax, d, species, box, plane="xy", vlim=2.5, nlevels=20, log=False,
 def plot_moments(dumps, species, sub):
     """Particle number, bulk velocity and temperature in every box vs time."""
     ds = [load_dump(p, fields=("moments", "vth")) for _, p in dumps]
-    t = np.array([d["time"] for d in ds])
+    t = np.array([d["time"] for d in ds]) * OMEGA_CI
     fig, axes = plt.subplots(3, 1, figsize=(6, 7), sharex=True, layout="constrained")
     for b in range(ds[0]["moments"].shape[1]):
         mom = [box_moments(d, species, b) for d in ds]
@@ -208,7 +296,7 @@ def plot_moments(dumps, species, sub):
     axes[0].set_ylabel(r"$N / N(t_0)$")
     axes[1].set_ylabel(rf"$U/v_{{\rm th,{sub}}}$   (x –, y --, z ··)")
     axes[2].set_ylabel(r"$T/T_0$   (xx –, yy --, zz ··)")
-    axes[2].set_xlabel(r"$t$")
+    axes[2].set_xlabel(r"$t\,\Omega_{ci}$")
     axes[0].legend(fontsize=8)
     return fig
 
@@ -227,6 +315,11 @@ def main():
     p.add_argument("--vlim", type=float, default=2.5, help="axis limit in v_th")
     p.add_argument("--levels", type=int, default=20, help="number of contour levels")
     p.add_argument("--smooth", type=int, default=0, help="1-2-1 smoothing passes")
+    p.add_argument("--slice", type=float, metavar="WIDTH",
+                   help="plot a slice of thickness WIDTH (in v_th) in the third "
+                        "velocity component instead of the reduced VDF (3D dumps only)")
+    p.add_argument("--slice-centre", type=float, default=0.0,
+                   help="centre of the slice in the third component, in v_th (default 0)")
     p.add_argument("--moments", action="store_true", help="box moments vs time")
     p.add_argument("--save", help="write the figure to this file instead of showing it")
     args = p.parse_args()
@@ -247,11 +340,15 @@ def main():
         else:
             raise SystemExit(f"no dump at step {args.step}; available: {steps}")
         d = load_dump(path)
+        if args.slice is not None and not has_3d(d):
+            raise SystemExit("--slice needs a dump with the 3D histogram (hist3d); "
+                             "this one only has the reduced planes")
         kw = dict(vlim=args.vlim, nlevels=args.levels, log=args.log,
                   nsmooth=args.smooth, sub=sub,
-                  ref=load_dump(dumps[0][1]) if args.diff else None)
+                  ref=load_dump(dumps[0][1]) if args.diff else None,
+                  slice_width=args.slice, slice_centre=args.slice_centre)
         if args.all:
-            nbox = d["hist"].shape[1]
+            nbox = len(d["boxes"])
             fig, axes = plt.subplots(nbox, 3, figsize=(9, 3.1 * nbox), squeeze=False,
                                      layout="constrained")
             for b in range(nbox):
@@ -267,8 +364,18 @@ def main():
                              (r"$\log_{10} f$" if args.log else r"$f$"))
             ax.set_title(box_title(d, args.box), fontsize=8)
         what = "f - f(t0)" if args.diff else "f"
-        fig.suptitle(f"{what}, species {args.species}, t = {d['time']:.6g} "
-                     f"(step {d['step']})", fontsize=10)
+        if args.slice is None:
+            what += " reduced"
+        else:   # third velocity component (for --all: of each plane); the range
+            # actually used is snapped to the bin edges
+            third = ("v_3" if args.all else
+                     "v_" + "xyz"[_third_axis(args.plane)])
+            _, _, (lo, hi) = slice_vdf(d, args.species, args.box, args.plane,
+                                       args.slice, args.slice_centre)
+            what += f" slice, {third} in [{lo:.3g}, {hi:.3g}] v_th"
+        fig.suptitle(f"{what}, species {args.species}\n"
+                     rf"$t\,\Omega_{{ci}}$ = {d['time'] * OMEGA_CI:.2f} (step {d['step']})",
+                     fontsize=9)
 
     if args.save:
         fig.savefig(args.save, dpi=200)

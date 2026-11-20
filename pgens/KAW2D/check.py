@@ -12,4 +12,5 @@ for cy in (0, 60, 80, 100):
 
 ax.set_xlim(-140, 140)
 ax.set_ylim(-140, 140)
+plt.savefig("VDF_boxes.png")
 plt.show()
